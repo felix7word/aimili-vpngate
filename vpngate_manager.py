@@ -38,7 +38,7 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
-MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
+MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "1500"))
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
@@ -151,8 +151,23 @@ def load_ui_config() -> dict[str, Any]:
                 
         return config
 
+def get_salt() -> str:
+    salt_file = DATA_DIR / "salt.txt"
+    try:
+        if salt_file.exists():
+            return salt_file.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    salt = uuid.uuid4().hex
+    try:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        salt_file.write_text(salt, encoding="utf-8")
+    except Exception:
+        pass
+    return salt
+
 def get_session_token(password: str, username: str = "admin") -> str:
-    salt = "aimilivpn_secure_salt_2026"
+    salt = get_salt()
     return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
 
 def cleanup_old_logs(logs_dir: Path) -> None:
@@ -978,13 +993,24 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         
             write_json(NODES_FILE, merged)
 
-        # Test the first 10 non-active nodes from the new list
+        # Test nodes — prioritize US (up to 100), fill rest with geographic diversity
         with lock:
             current_nodes = read_json(NODES_FILE, [])
-            to_test = [n for n in current_nodes if not n.get("active")][:10]
+            untested = [n for n in current_nodes if not n.get("active")]
+            us_nodes = [n for n in untested if n.get("country_short") == "US"]
+            other_nodes = [n for n in untested if n.get("country_short") != "US"]
+            to_test = us_nodes[:100]
+            seen_countries: dict[str, int] = {"US": 100}
+            for n in other_nodes:
+                c = n.get("country_short") or "XX"
+                if seen_countries.get(c, 0) < 2:
+                    to_test.append(n)
+                    seen_countries[c] = seen_countries.get(c, 0) + 1
+                    if len(to_test) >= 500:
+                        break
             to_test_ids = [n["id"] for n in to_test]
-            
-        print(f"[维护线程] 正在检测新获取列表的前 10 个节点: {to_test_ids}", flush=True)
+
+        print(f"[维护线程] 正在多样性检测 {len(to_test)} 个节点（{len(seen_countries)} 个国家/地区）: {to_test_ids}", flush=True)
         set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
         test_multiple_nodes(to_test_ids)
         
@@ -2125,34 +2151,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
-  <section class="ad-section">
-    <div class="ad-card">
-      <div class="ad-title">
-        <span class="ad-badge">推荐</span> <strong>购买高性价比 VPS 搭建节点或用作客户端</strong>
-      </div>
-      <div class="ad-links">
-        <div class="ad-item">
-          <span class="ad-tag tag-normal">普通用户推荐</span>
-          <span class="ad-desc">RackNerd - 超低折扣价格，日常使用实惠方便，海外多机房可选，推荐普通家庭或低频用户。</span>
-          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-        <div class="ad-item">
-          <span class="ad-tag tag-opt">网络优化推荐</span>
-          <span class="ad-desc">VMiss - 专线优化网络 (CN2 GIA/9929/CMIN2 等顶级线路)，低延迟不丢包，推荐高网络要求用户。</span>
-          <a href="https://app.vmiss.com/aff.php?aff=4619" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-        <div class="ad-item">
-          <span class="ad-tag tag-premium">高端企业推荐</span>
-          <span class="ad-desc">BandwagonHost (搬瓦工) - 直连三网顶级专线，经典高带宽 CN2 GIA 线路，超凡稳定速度。</span>
-          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-      </div>
-      <div class="ad-footer">
-        官方技术支持及优质资源交流论坛：<a href="https://339936.xyz" target="_blank" class="forum-link">339936.xyz</a>
-      </div>
-    </div>
-  </section>
-
+#
   <!-- 当前连接活动节点卡片 -->
   <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
     <!-- Rendered dynamically by render() -->
