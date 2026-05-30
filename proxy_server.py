@@ -7,6 +7,10 @@ import urllib.parse
 import time
 from typing import Any
 
+# Global: set to (host, port, type) to route all proxy traffic through an upstream proxy
+# type is "http" or "socks5"
+UPSTREAM_PROXY: tuple[str, int, str] | None = None
+
 def parse_int(value: Any) -> int:
     try:
         return int(value)
@@ -113,8 +117,80 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         offset += rdlength
     return None
 
+def create_connection_via_upstream(host: str, port: int, proxy_host: str, proxy_port: int, proxy_type: str, timeout: float = 20) -> socket.socket:
+    """Connect to (host:port) via an upstream HTTP/SOCKS5 proxy."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((proxy_host, proxy_port))
+    except OSError as e:
+        sock.close()
+        raise ConnectionError(f"Cannot connect to upstream proxy {proxy_host}:{proxy_port}: {e}") from e
+
+    try:
+        if proxy_type == "http":
+            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode()
+            sock.sendall(req)
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("HTTP upstream proxy: connection closed during CONNECT")
+                resp += chunk
+            status_line = resp.split(b"\r\n")[0]
+            if b"200" not in status_line:
+                sock.close()
+                raise ConnectionError(f"HTTP upstream proxy CONNECT rejected: {status_line.decode(errors='replace')}")
+            return sock
+
+        elif proxy_type == "socks5":
+            sock.sendall(b"\x05\x01\x00")  # SOCKS5, 1 method, no auth
+            resp = recv_exact(sock, 2)
+            if resp != b"\x05\x00":
+                sock.close()
+                raise ConnectionError(f"SOCKS5 upstream proxy: handshake failed: {resp.hex()}")
+
+            try:
+                ip4 = socket.inet_aton(host)
+                req = b"\x05\x01\x00\x01" + ip4 + port.to_bytes(2, "big")
+            except OSError:
+                # Domain name
+                host_enc = host.encode("idna")
+                req = b"\x05\x01\x00\x03" + len(host_enc).to_bytes(1, "big") + host_enc + port.to_bytes(2, "big")
+
+            sock.sendall(req)
+            resp = recv_exact(sock, 4)
+            if resp[1] != 0x00:
+                sock.close()
+                raise ConnectionError(f"SOCKS5 upstream proxy CONNECT rejected: status={resp[1]}")
+
+            # Read remaining bind address
+            atype = resp[3]
+            if atype == 1:
+                recv_exact(sock, 6)  # IPv4 (4) + port (2)
+            elif atype == 3:
+                domain_len = recv_exact(sock, 1)[0]
+                recv_exact(sock, domain_len + 2)
+            elif atype == 4:
+                recv_exact(sock, 18)  # IPv6 (16) + port (2)
+            return sock
+
+        else:
+            sock.close()
+            raise ValueError(f"Unknown upstream proxy type: {proxy_type}")
+    except Exception:
+        sock.close()
+        raise
+
+
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+    global UPSTREAM_PROXY
     host, port = address
+
+    if UPSTREAM_PROXY is not None:
+        proxy_host, proxy_port, proxy_type = UPSTREAM_PROXY
+        return create_connection_via_upstream(host, port, proxy_host, proxy_port, proxy_type, timeout)
+
     resolved_ip = resolve_dns_over_tun0(host)
     if resolved_ip:
         host = resolved_ip

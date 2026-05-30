@@ -33,6 +33,7 @@ socket.getaddrinfo = _ipv4_getaddrinfo
 
 import vpn_utils
 import proxy_server
+import proxy_sources
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
@@ -297,6 +298,9 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "location": "",
         "ip_type": "",
         "quality": "",
+        "is_hosting": False,
+        "source": "vpngate",
+        "proxy_type": "",
         "latency_ms": 0,
         "config_file": str(config_path),
         "config_text": config_text,
@@ -572,6 +576,7 @@ def cleanup_policy_routing() -> None:
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
+    proxy_server.UPSTREAM_PROXY = None
     cleanup_policy_routing()
     config_to_delete = None
     if active_openvpn_node_id:
@@ -842,7 +847,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
 def connect_node(node_id: str) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting
+    global active_openvpn_process, active_openvpn_node_id, is_connecting, last_active_ping_time, last_active_latency
     with lock:
         if is_connecting:
             print("[连接] 正在建立其他连接中，跳过此请求", flush=True)
@@ -857,7 +862,58 @@ def connect_node(node_id: str) -> str:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
-        
+
+        # === External proxy node (HTTP/SOCKS5) ===
+        if node.get("source") == "external":
+            log_to_json("INFO", "VPN", f"连接外部代理节点: {node_id}")
+            stop_active_openvpn()
+
+            ext_host = node.get("proxy_host") or node.get("ip")
+            ext_port = parse_int(node.get("proxy_port"))
+            ext_type = node.get("proxy_type", "http")
+            if not ext_host or not ext_port:
+                raise ValueError(f"External proxy node missing address: {node_id}")
+
+            set_state(active_node_latency="连接代理", last_check_message=f"正在连接外部 {ext_type.upper()} 代理 {ext_host}:{ext_port}...")
+            proxy_server.UPSTREAM_PROXY = (ext_host, ext_port, ext_type)
+
+            # Quick connectivity test
+            latency = proxy_sources.test_proxy_connectivity(ext_host, ext_port, ext_type, timeout=10)
+            if latency <= 0:
+                proxy_server.UPSTREAM_PROXY = None
+                node["probe_status"] = "unavailable"
+                node["probe_message"] = "外部代理连接失败"
+                for item in nodes:
+                    item["active"] = False
+                write_json(NODES_FILE, nodes)
+                set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message="外部代理连接失败")
+                with lock:
+                    active_openvpn_node_id = ""
+                raise RuntimeError(f"External proxy {ext_host}:{ext_port} unreachable")
+
+            active_openvpn_process = None
+            active_openvpn_node_id = node_id
+            last_active_ping_time = time.time()
+            last_active_latency = latency
+
+            for item in nodes:
+                item["active"] = item.get("id") == node_id
+                if item["active"]:
+                    item["probe_message"] = f"Active via {ext_type.upper()} proxy {ext_host}:{ext_port}"
+            write_json(NODES_FILE, nodes)
+
+            set_state(last_check_message="正在测试代理出口...")
+            res = check_proxy_health()
+            if res["ok"]:
+                set_state(proxy_ok=True, proxy_ip=res["ip"], proxy_latency_ms=res["latency_ms"], proxy_error="")
+            else:
+                set_state(proxy_ok=False, proxy_ip="-", proxy_latency_ms=0, proxy_error=res.get("error", "未知错误"))
+
+            set_state(active_openvpn_node_id=node_id, is_connecting=False, active_node_latency=f"{latency} ms", last_check_message=f"已连接外部代理 {ext_host}:{ext_port}")
+            log_to_json("INFO", "VPN", f"外部代理 {ext_host}:{ext_port} 连接成功")
+            return f"Connected external proxy {ext_host}:{ext_port}"
+
+        # === VPNGate OpenVPN node ===
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
         stop_active_openvpn()
 
@@ -894,7 +950,6 @@ def connect_node(node_id: str) -> str:
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
         
-        global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
         last_active_latency = 0
         
@@ -1008,26 +1063,26 @@ def maintain_valid_nodes(force: bool = False) -> str:
             current_nodes = read_json(NODES_FILE, [])
             untested = [n for n in current_nodes if not n.get("active")]
 
-        # 预查询美国节点的 IP 类型来识别住宅 IP
+        # 预查询美国节点的 IP 类型来识别非机房（住宅类）IP
         us_untested = [n for n in untested if n.get("country_short") == "US"]
         if us_untested:
-            print(f"\n[美国住宅采集] 预查询 {len(us_untested)} 个美国节点的 IP 类型...", flush=True)
+            print(f"\n[美国IP采集] 预查询 {len(us_untested)} 个美国节点的 IP 归属信息...", flush=True)
             vpn_utils.enrich_ip_info(us_untested)
             with lock:
                 write_json(NODES_FILE, current_nodes)
 
-        # 按优先级构建测试列表：美国住宅 > 美国其他 > 各国多样性
+        # 按优先级构建测试列表：美国非机房 > 美国机房 > 各国多样性
         with lock:
             current_nodes = read_json(NODES_FILE, [])
             untested = [n for n in current_nodes if not n.get("active")]
 
-            us_residential = [n for n in untested if n.get("country_short") == "US" and n.get("ip_type") == "residential"]
-            us_other = [n for n in untested if n.get("country_short") == "US" and n.get("ip_type") != "residential"]
+            us_non_hosting = [n for n in untested if n.get("country_short") == "US" and not n.get("is_hosting")]
+            us_hosting = [n for n in untested if n.get("country_short") == "US" and n.get("is_hosting")]
             other_countries = [n for n in untested if n.get("country_short") != "US"]
 
-            print(f"[美国住宅采集] 美国节点: {len(us_residential)} 个住宅IP, {len(us_other)} 个其他类型", flush=True)
+            print(f"[美国IP采集] 美国节点: {len(us_non_hosting)} 个非机房IP, {len(us_hosting)} 个机房IP", flush=True)
 
-            to_test = us_residential[:200] + us_other[:50]
+            to_test = us_non_hosting[:200] + us_hosting[:50]
             seen_countries: dict[str, int] = {"US": len(to_test)}
             for n in other_countries:
                 c = n.get("country_short") or "XX"
@@ -1039,32 +1094,157 @@ def maintain_valid_nodes(force: bool = False) -> str:
             to_test_ids = [n["id"] for n in to_test]
 
         total_to_test = len(to_test_ids)
-        us_res_count = min(len(us_residential), 200)
-        print(f"[美国住宅采集] 开始并发检测 {total_to_test} 个节点（含 {us_res_count} 个美国住宅IP），目标可用 ≥5 个 | 最多用时 3 分钟", flush=True)
+        us_non_host_count = min(len(us_non_hosting), 200)
+        print(f"[美国IP采集] 开始并发检测 {total_to_test} 个节点（含 {us_non_host_count} 个美国非机房IP），目标可用 ≥5 个 | 最多用时 3 分钟", flush=True)
 
         start_time = time.time()
-        us_res_avail_tracker: dict[str, bool] = {}  # node_id -> is_residential
+        us_non_host_avail: set[str] = set()  # non-hosting available US node ids
+        us_all_avail: set[str] = set()       # all available US node ids
 
         def test_progress(completed: int, total: int, result: dict[str, Any]) -> None:
             elapsed = int(time.time() - start_time)
             nid = result.get("id", "")
             if result.get("probe_status") == "available" and result.get("country_short") == "US":
-                is_res = result.get("ip_type") == "residential"
-                us_res_avail_tracker[nid] = is_res
-            avail_count = sum(1 for v in us_res_avail_tracker.values() if v)
-            us_avail_all = len(us_res_avail_tracker)
+                us_all_avail.add(nid)
+                if not result.get("is_hosting"):
+                    us_non_host_avail.add(nid)
             if completed % 10 == 0 or completed == total or elapsed % 10 < 2:
-                print(f"[美国住宅采集] 进度 {completed}/{total} | 可用美国 {us_avail_all} 个（住宅 {avail_count} 个）| 已用 {elapsed}s", flush=True)
+                print(f"[美国IP采集] 进度 {completed}/{total} | 可用美国 {len(us_all_avail)} 个（非机房 {len(us_non_host_avail)} 个）| 已用 {elapsed}s", flush=True)
 
-        set_state(is_connecting=True, last_check_message=f"正在优先采集美国住宅IP（目标≥5个可用），共 {total_to_test} 个候选...")
+        set_state(is_connecting=True, last_check_message=f"正在优先采集美国非机房IP（目标≥5个可用），共 {total_to_test} 个候选...")
         test_multiple_nodes(to_test_ids, progress_callback=test_progress)
 
         # 完成汇总
         elapsed = int(time.time() - start_time)
-        avail_us_res = sum(1 for v in us_res_avail_tracker.values() if v)
-        avail_us_total = len(us_res_avail_tracker)
-        print(f"\n[美国住宅采集] 采集完成！总用时 {elapsed}s | 可用美国节点 {avail_us_total} 个（住宅IP {avail_us_res} 个）", flush=True)
-        
+        print(f"\n[美国IP采集] 采集完成！总用时 {elapsed}s | 可用美国节点 {len(us_all_avail)} 个（非机房 {len(us_non_host_avail)} 个）", flush=True)
+
+        # === 外部代理源采集（HTTP/SOCKS5） ===
+        try:
+            print(f"\n[外部代理] 正在从多个源获取免费 HTTP/SOCKS5 代理...", flush=True)
+            ext_proxies = proxy_sources.fetch_all_proxies()
+        except Exception as e:
+            print(f"[外部代理] 获取失败: {e}", flush=True)
+            ext_proxies = []
+
+        if ext_proxies:
+            # 预查询 IP 类型来识别美国非机房 IP
+            print(f"[外部代理] 正在通过 ip-api.com 查询 {len(ext_proxies)} 个代理的 IP 归属...", flush=True)
+            ext_node_dicts: list[dict[str, Any]] = []
+            for p in ext_proxies:
+                ext_node_dicts.append({
+                    "ip": p["ip"],
+                    "remote_host": p["ip"],
+                    "owner": "",
+                    "asn": "",
+                    "as_name": "",
+                    "location": "",
+                    "ip_type": "",
+                    "quality": "",
+                    "is_hosting": False,
+                })
+            vpn_utils.enrich_ip_info(ext_node_dicts)
+
+            # 筛选美国非机房代理
+            us_non_hosting_ext = []
+            for i, p in enumerate(ext_proxies):
+                info = ext_node_dicts[i]
+                is_us = "美国" in info.get("location", "") or "United States" in info.get("location", "")
+                if not is_us:
+                    continue
+                if info.get("is_hosting"):
+                    continue
+                us_non_hosting_ext.append({**p, **info})
+
+            print(f"[外部代理] 美国非机房代理: {len(us_non_hosting_ext)} 个（过滤掉 {len(ext_proxies) - len(us_non_hosting_ext)} 个机房/非美国）", flush=True)
+
+            if us_non_hosting_ext:
+                # 并发测试可用性
+                print(f"[外部代理] 开始并发测试美国非机房代理...", flush=True)
+                ext_start = time.time()
+                ext_available: list[dict[str, Any]] = []
+
+                def test_ext_worker(ep: dict[str, Any]) -> dict[str, Any] | None:
+                    lat = proxy_sources.test_proxy_connectivity(ep["ip"], ep["port"], ep["type"], timeout=8)
+                    if lat > 0:
+                        return {
+                            "ip": ep["ip"],
+                            "port": ep["port"],
+                            "type": ep["type"],
+                            "source": ep.get("source", "unknown"),
+                            "latency_ms": lat,
+                            "location": ep.get("location", ""),
+                            "owner": ep.get("owner", ""),
+                        }
+                    return None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(50, len(us_non_hosting_ext))) as ext_executor:
+                    ext_futures = {ext_executor.submit(test_ext_worker, ep): ep for ep in us_non_hosting_ext}
+                    ext_done = 0
+                    ext_total = len(ext_futures)
+                    for f in concurrent.futures.as_completed(ext_futures):
+                        ext_done += 1
+                        try:
+                            result = f.result()
+                            if result:
+                                ext_available.append(result)
+                        except Exception:
+                            pass
+                        if ext_done % 10 == 0 or ext_done == ext_total:
+                            print(f"[外部代理] 进度 {ext_done}/{ext_total} | 已发现 {len(ext_available)} 个可用", flush=True)
+
+                ext_elapsed = int(time.time() - ext_start)
+                print(f"[外部代理] 测试完成！{ext_elapsed}s | {len(ext_available)}/{ext_total} 个可用", flush=True)
+
+                # 加入节点列表
+                if ext_available:
+                    with lock:
+                        current_nodes = read_json(NODES_FILE, [])
+                        existing_ips = {n.get("ip") for n in current_nodes if n.get("ip")}
+                        added = 0
+                        for ep in ext_available:
+                            if ep["ip"] in existing_ips:
+                                continue
+                            node_id = f"ext_{ep['type']}_{ep['ip']}_{ep['port']}"
+                            if any(n.get("id") == node_id for n in current_nodes):
+                                continue
+                            current_nodes.append({
+                                "id": node_id,
+                                "country": "美国",
+                                "country_short": "US",
+                                "host_name": f"外部{ep['type'].upper()}代理",
+                                "ip": ep["ip"],
+                                "score": 100,
+                                "ping": ep["latency_ms"],
+                                "speed": 0,
+                                "sessions": 0,
+                                "owner": ep.get("owner", ""),
+                                "asn": "",
+                                "as_name": "",
+                                "location": ep.get("location", ""),
+                                "ip_type": "residential",
+                                "quality": "normal",
+                                "is_hosting": False,
+                                "latency_ms": ep["latency_ms"],
+                                "config_file": "",
+                                "config_text": "",
+                                "proto": "tcp",
+                                "remote_host": ep["ip"],
+                                "remote_port": ep["port"],
+                                "fetched_at": time.time(),
+                                "probe_status": "available",
+                                "probe_message": f"外部{ep['type'].upper()}代理 - {ep['source']}",
+                                "probed_at": time.time(),
+                                "source": "external",
+                                "proxy_type": ep["type"],
+                                "proxy_host": ep["ip"],
+                                "proxy_port": ep["port"],
+                            })
+                            existing_ips.add(ep["ip"])
+                            added += 1
+                        write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                        print(f"[外部代理] 已添加 {added} 个外部代理到节点列表", flush=True)
+        # === 外部代理采集结束 ===
+
         is_connecting = False
         
         with lock:
@@ -2702,10 +2882,13 @@ function render(){
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
         : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
+      const sourceBadge = n.source === 'external'
+        ? `<span class="badge" style="background:rgba(99,102,241,0.2);color:#a5b4fc;font-size:10px;padding:1px 6px;">${esc(n.proxy_type||'ext').toUpperCase()}</span>`
+        : `<span class="badge" style="background:rgba(16,185,129,0.15);color:#6ee7b7;font-size:10px;padding:1px 6px;">OVPN</span>`;
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td>${latencyText}</td>
-        <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""} ${sourceBadge}</td>
         <td>${esc(displayLocation)}</td>
         <td class="mono" style="font-size:12px; color:var(--text-secondary);">${esc(n.asn||"-")}</td>
         <td>${esc(n.owner||n.as_name||"-")}</td>
@@ -3126,13 +3309,15 @@ def check_proxy_health() -> dict[str, Any]:
             "error": f"代理服务未运行 (端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e})"
         }
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
-    if sys.platform.startswith("linux") and not tun_path.exists():
-        return {
-            "ok": False,
-            "error": "VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
-        }
+    # 2. 检测路由可用性
+    using_upstream = proxy_server.UPSTREAM_PROXY is not None
+    if not using_upstream:
+        tun_path = Path("/sys/class/net/tun0")
+        if sys.platform.startswith("linux") and not tun_path.exists():
+            return {
+                "ok": False,
+                "error": "VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
     cmd = [
@@ -3222,7 +3407,8 @@ def active_node_pinger() -> None:
     global active_openvpn_node_id, is_connecting
     while True:
         try:
-            if active_openvpn_running() and active_openvpn_node_id:
+            has_active = active_openvpn_running() or (active_openvpn_node_id and proxy_server.UPSTREAM_PROXY is not None)
+            if has_active and active_openvpn_node_id:
                 nodes = read_json(NODES_FILE, [])
                 node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
                 if node:

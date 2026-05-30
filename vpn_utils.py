@@ -341,6 +341,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             node["location"] = cached.get("location", "")
             node["ip_type"] = cached.get("ip_type", "")
             node["quality"] = cached.get("quality", "")
+            node["is_hosting"] = cached.get("is_hosting", False)
         else:
             if ip not in ips_to_query:
                 ips_to_query.append(ip)
@@ -395,6 +396,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                         "location": loc,
                         "ip_type": ip_type,
                         "quality": quality,
+                        "is_hosting": item.get("hosting", False),
                         "cached_at": now,
                     }
         except Exception as e:
@@ -420,3 +422,4 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             node["location"] = cached.get("location", "")
             node["ip_type"] = cached.get("ip_type", "")
             node["quality"] = cached.get("quality", "")
+            node["is_hosting"] = cached.get("is_hosting", False)
