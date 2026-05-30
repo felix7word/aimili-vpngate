@@ -32,6 +32,7 @@ logs/
 scratch/
 *连接配置*
 
-# Local analysis and doc files
+# Local analysis and doc files (may contain credentials)
 AimiliVPN_Analysis_ZH.md
+密钥配置说明.md
 

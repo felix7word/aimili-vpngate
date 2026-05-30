@@ -104,6 +104,12 @@ EnvironmentFile=-/etc/default/aimilivpn
 WantedBy=multi-user.target
 EOF
 
+echo -e "  -> 正在创建环境变量配置文件 /etc/default/aimilivpn ..."
+cat > /etc/default/aimilivpn <<EOF
+# AimiliVPN 环境变量配置（由 install.sh 自动生成）
+# AIMILIVPN_KEY 将在后续配置步骤中填入
+EOF
+
 echo -e "  -> 正在重新加载 systemd 系统服务列表并启用开机自启..."
 systemctl daemon-reload
 systemctl enable aimilivpn.service
@@ -901,6 +907,26 @@ cfg = {
 with open('$AUTH_FILE', 'w', encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
 "
+fi
+
+# 7. Configure AIMILIVPN_KEY
+echo -e "\n${YELLOW}[密钥验证配置]${PLAIN}"
+echo -e "  ${YELLOW}如果 vpngate_manager.py 中配置了 _STARTUP_KEY_HASH，${PLAIN}"
+echo -e "  ${YELLOW}则必须提供正确的启动密钥才能运行服务。${PLAIN}"
+if [ -z "${AIMILIVPN_KEY:-}" ]; then
+    read -p "  请输入启动密钥 (AIMILIVPN_KEY, 留空则跳过): " input_key
+    if [ -n "$input_key" ]; then
+        AIMILIVPN_KEY="$input_key"
+    fi
+fi
+
+if [ -n "${AIMILIVPN_KEY:-}" ]; then
+    echo -e "  -> 正在写入 AIMILIVPN_KEY 到 /etc/default/aimilivpn ..."
+    cat > /etc/default/aimilivpn <<EOF
+# AimiliVPN 环境变量配置（由 install.sh 自动生成）
+AIMILIVPN_KEY=${AIMILIVPN_KEY}
+EOF
+    echo -e "${GREEN}  -> 启动密钥已配置${PLAIN}"
 fi
 
 # 8. Start service

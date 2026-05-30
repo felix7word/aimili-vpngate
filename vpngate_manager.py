@@ -59,7 +59,7 @@ INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 *
 # ============================================================
 _STARTUP_KEY_HASH = os.environ.get(
     "AIMILIVPN_KEY_HASH",
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",  # default: empty hash
+    "35ebc3b74d9a3dc0d778d9dc4a4ac7b3184128214232bf51cd2073e8907c2077",  # generated 2026-05-30
 )
 
 def verify_startup_key() -> None:
