@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import json
 import os
 import queue
@@ -49,6 +50,52 @@ LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
+
+# ============================================================
+# 启动密钥验证
+# 将此项目部署到自有服务器时，用 --genkey 生成密钥，
+# 然后将生成的 HASH 填入下方 _STARTUP_KEY_HASH。
+# 之后每次启动需设置环境变量 AIMILIVPN_KEY=你的密钥。
+# ============================================================
+_STARTUP_KEY_HASH = os.environ.get(
+    "AIMILIVPN_KEY_HASH",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",  # default: empty hash
+)
+
+def verify_startup_key() -> None:
+    """Check startup key before proceeding."""
+    if not _STARTUP_KEY_HASH:
+        return
+    key = os.environ.get("AIMILIVPN_KEY", "")
+    if not key and sys.stdin.isatty():
+        print("=" * 50, flush=True)
+        key = input("请输入启动密钥 (AIMILIVPN_KEY): ").strip()
+    if not key:
+        print("[密钥验证] 错误: 未提供启动密钥", flush=True)
+        print("[密钥验证] 请设置环境变量: export AIMILIVPN_KEY=你的密钥", flush=True)
+        print("[密钥验证] 如果你是首次部署，运行: python3 vpngate_manager.py --genkey", flush=True)
+        sys.exit(1)
+    if hashlib.sha256(key.encode()).hexdigest() != _STARTUP_KEY_HASH:
+        print("[密钥验证] 错误: 启动密钥不正确", flush=True)
+        sys.exit(1)
+    print("[密钥验证] 启动密钥验证通过", flush=True)
+
+def generate_startup_key() -> None:
+    """Generate a random startup key and its hash."""
+    import string
+    chars = string.ascii_letters + string.digits
+    key = "".join(__import__("random").choices(chars, k=24))
+    h = hashlib.sha256(key.encode()).hexdigest()
+    print("=" * 60)
+    print("  生成的启动密钥")
+    print("=" * 60)
+    print(f"  密钥: {key}")
+    print(f"  HASH: {h}")
+    print()
+    print("  部署步骤:")
+    print(f"  1. 将上方 HASH 填入 vpngate_manager.py 的 _STARTUP_KEY_HASH")
+    print(f"  2. 运行时设置环境变量: export AIMILIVPN_KEY={key}")
+    print("=" * 60)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -3789,6 +3836,7 @@ class Tee:
         self.file.flush()
 
 def main() -> None:
+    verify_startup_key()
     ensure_dirs()
     kill_existing_openvpn_processes()
     
@@ -3851,4 +3899,14 @@ def main() -> None:
     ThreadingHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--genkey":
+        generate_startup_key()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--hash":
+        # Compute hash of a given key: python3 vpngate_manager.py --hash mykey
+        k = sys.argv[2] if len(sys.argv) > 2 else ""
+        if k:
+            print(hashlib.sha256(k.encode()).hexdigest())
+        else:
+            print("用法: python3 vpngate_manager.py --hash <密钥>")
+    else:
+        main()
