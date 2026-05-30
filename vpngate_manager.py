@@ -18,7 +18,7 @@ import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import concurrent.futures
 import sys
 import uuid
@@ -697,11 +697,12 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         else:
             return {}
 
-def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
+def test_multiple_nodes(node_ids: list[str],
+                        progress_callback: Callable[[int, int, dict[str, Any]], None] | None = None) -> list[dict[str, Any]]:
     with lock:
         nodes = read_json(NODES_FILE, [])
         to_test = [n for n in nodes if n.get("id") in node_ids]
-        
+
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
         node_id = n_info["id"]
@@ -710,30 +711,32 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
         fallback_ping = parse_int(n_info.get("ping"))
-        
+        country_short = n_info.get("country_short", "")
+
         temp_path = Path(config_file)
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
             temp_path.write_text(config_text, encoding="utf-8")
         except Exception:
             pass
-            
+
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
         dev_name = f"tun{idx + 1}"
         ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
-        
+
         try:
             if temp_path.exists():
                 temp_path.unlink()
         except Exception:
             pass
-            
-        temp_node = {
+
+        temp_node: dict[str, Any] = {
             "id": node_id,
             "latency_ms": latency,
             "probe_status": "available" if ok else "unavailable",
             "probe_message": message,
             "probed_at": time.time(),
+            "country_short": country_short,
             "owner": "",
             "asn": "",
             "as_name": "",
@@ -742,7 +745,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "quality": "",
         }
         if ok:
-            ip_to_enrich = {
+            ip_to_enrich: dict[str, Any] = {
                 "ip": n_info.get("ip"),
                 "remote_host": h,
                 "owner": "",
@@ -757,21 +760,28 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(to_test))) as executor:
+    max_workers = max(1, min(len(to_test), 50))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
+        completed = 0
+        total = len(futures)
         for future in concurrent.futures.as_completed(futures):
             nid = futures[future]
             try:
                 res = future.result()
                 updated_nodes_map[nid] = res
             except Exception as e:
-                updated_nodes_map[nid] = {
+                res = {
                     "id": nid,
                     "probe_status": "unavailable",
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
-                
+                updated_nodes_map[nid] = res
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total, res)
+
     with lock:
         current_nodes = read_json(NODES_FILE, [])
         for n in current_nodes:
@@ -780,7 +790,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 n.update(updated_nodes_map[nid])
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
-        
+
     return list(updated_nodes_map.values())
 
 def auto_switch_node(attempt: int = 0) -> None:
@@ -993,26 +1003,67 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         
             write_json(NODES_FILE, merged)
 
-        # Test nodes — prioritize US (up to 100), fill rest with geographic diversity
+        # --- 优先采集美国住宅 IP ---
         with lock:
             current_nodes = read_json(NODES_FILE, [])
             untested = [n for n in current_nodes if not n.get("active")]
-            us_nodes = [n for n in untested if n.get("country_short") == "US"]
-            other_nodes = [n for n in untested if n.get("country_short") != "US"]
-            to_test = us_nodes[:100]
-            seen_countries: dict[str, int] = {"US": 100}
-            for n in other_nodes:
+
+        # 预查询美国节点的 IP 类型来识别住宅 IP
+        us_untested = [n for n in untested if n.get("country_short") == "US"]
+        if us_untested:
+            print(f"\n[美国住宅采集] 预查询 {len(us_untested)} 个美国节点的 IP 类型...", flush=True)
+            vpn_utils.enrich_ip_info(us_untested)
+            with lock:
+                write_json(NODES_FILE, current_nodes)
+
+        # 按优先级构建测试列表：美国住宅 > 美国其他 > 各国多样性
+        with lock:
+            current_nodes = read_json(NODES_FILE, [])
+            untested = [n for n in current_nodes if not n.get("active")]
+
+            us_residential = [n for n in untested if n.get("country_short") == "US" and n.get("ip_type") == "residential"]
+            us_other = [n for n in untested if n.get("country_short") == "US" and n.get("ip_type") != "residential"]
+            other_countries = [n for n in untested if n.get("country_short") != "US"]
+
+            print(f"[美国住宅采集] 美国节点: {len(us_residential)} 个住宅IP, {len(us_other)} 个其他类型", flush=True)
+
+            to_test = us_residential[:200] + us_other[:50]
+            seen_countries: dict[str, int] = {"US": len(to_test)}
+            for n in other_countries:
                 c = n.get("country_short") or "XX"
                 if seen_countries.get(c, 0) < 2:
                     to_test.append(n)
                     seen_countries[c] = seen_countries.get(c, 0) + 1
-                    if len(to_test) >= 500:
-                        break
+                if len(to_test) >= 500:
+                    break
             to_test_ids = [n["id"] for n in to_test]
 
-        print(f"[维护线程] 正在多样性检测 {len(to_test)} 个节点（{len(seen_countries)} 个国家/地区）: {to_test_ids}", flush=True)
-        set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
-        test_multiple_nodes(to_test_ids)
+        total_to_test = len(to_test_ids)
+        us_res_count = min(len(us_residential), 200)
+        print(f"[美国住宅采集] 开始并发检测 {total_to_test} 个节点（含 {us_res_count} 个美国住宅IP），目标可用 ≥5 个 | 最多用时 3 分钟", flush=True)
+
+        start_time = time.time()
+        us_res_avail_tracker: dict[str, bool] = {}  # node_id -> is_residential
+
+        def test_progress(completed: int, total: int, result: dict[str, Any]) -> None:
+            elapsed = int(time.time() - start_time)
+            nid = result.get("id", "")
+            if result.get("probe_status") == "available" and result.get("country_short") == "US":
+                is_res = result.get("ip_type") == "residential"
+                us_res_avail_tracker[nid] = is_res
+            avail_count = sum(1 for v in us_res_avail_tracker.values() if v)
+            us_avail_all = len(us_res_avail_tracker)
+            if completed % 10 == 0 or completed == total or elapsed % 10 < 2:
+                print(f"[美国住宅采集] 进度 {completed}/{total} | 可用美国 {us_avail_all} 个（住宅 {avail_count} 个）| 已用 {elapsed}s", flush=True)
+
+        set_state(is_connecting=True, last_check_message=f"正在优先采集美国住宅IP（目标≥5个可用），共 {total_to_test} 个候选...")
+        test_multiple_nodes(to_test_ids, progress_callback=test_progress)
+
+        # 完成汇总
+        elapsed = int(time.time() - start_time)
+        avail_us_res = sum(1 for v in us_res_avail_tracker.values() if v)
+        avail_us_total = len(us_res_avail_tracker)
+        print(f"\n[美国住宅采集] 采集完成！总用时 {elapsed}s | 可用美国节点 {avail_us_total} 个（住宅IP {avail_us_res} 个）", flush=True)
         
         is_connecting = False
         
